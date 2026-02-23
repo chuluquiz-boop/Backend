@@ -994,6 +994,29 @@ app.patch("/api/admin/questions/:id/move", async (req, res) => {
     return res.status(500).json({ ok: false, message: err?.message || "Server error" });
   }
 });
+// ✅ Logout: حذف session_token من user_sessions
+app.post("/api/logout", async (req, res) => {
+  try {
+    const { session_token } = req.body || {};
+    const token = String(session_token || "").trim();
 
+    if (!token) {
+      return res.status(400).json({ ok: false, message: "Missing session_token" });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("user_sessions")
+      .delete()
+      .eq("token", token);
+
+    if (error) {
+      return res.status(400).json({ ok: false, message: error.message });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
