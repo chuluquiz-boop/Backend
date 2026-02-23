@@ -1018,5 +1018,204 @@ app.post("/api/logout", async (req, res) => {
     return res.status(500).json({ ok: false, message: err?.message || "Server error" });
   }
 });
+// ===============================
+// ✅ Partners CRUD (NO AUTH - demo)
+// ===============================
+
+// GET all partners
+app.get("/api/admin/partners", async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("partners")
+      .select("id, kind, name, logo_path, state, order_index, created_at")
+      .order("order_index", { ascending: true })
+      .order("created_at", { ascending: false });
+
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+    return res.json({ ok: true, partners: data || [] });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// CREATE partner
+app.post("/api/admin/partners", async (req, res) => {
+  try {
+    const { kind, name, logo_path, state = 1, order_index = 0 } = req.body || {};
+
+    if (!["host", "sponsor"].includes(String(kind))) {
+      return res.status(400).json({ ok: false, message: "kind must be host|sponsor" });
+    }
+    if (!name || String(name).trim().length < 2) {
+      return res.status(400).json({ ok: false, message: "name غير صالح" });
+    }
+    if (!logo_path || String(logo_path).trim().length < 5) {
+      return res.status(400).json({ ok: false, message: "logo_path غير صالح" });
+    }
+
+    const row = {
+      kind: String(kind),
+      name: String(name).trim(),
+      logo_path: String(logo_path).trim(),
+      state: Number(state),
+      order_index: Number(order_index) || 0,
+    };
+
+    const { data, error } = await supabaseAdmin
+      .from("partners")
+      .insert(row)
+      .select("id, kind, name, logo_path, state, order_index, created_at")
+      .single();
+
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+    return res.json({ ok: true, partner: data });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// UPDATE partner
+app.put("/api/admin/partners/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { kind, name, logo_path, state, order_index } = req.body || {};
+
+    const patch = {};
+    if (kind != null) {
+      if (!["host", "sponsor"].includes(String(kind))) {
+        return res.status(400).json({ ok: false, message: "kind must be host|sponsor" });
+      }
+      patch.kind = String(kind);
+    }
+    if (name != null) {
+      if (String(name).trim().length < 2) {
+        return res.status(400).json({ ok: false, message: "name غير صالح" });
+      }
+      patch.name = String(name).trim();
+    }
+    if (logo_path != null) {
+      if (String(logo_path).trim().length < 5) {
+        return res.status(400).json({ ok: false, message: "logo_path غير صالح" });
+      }
+      patch.logo_path = String(logo_path).trim();
+    }
+    if (state != null) patch.state = Number(state);
+    if (order_index != null) patch.order_index = Number(order_index) || 0;
+
+    const { data, error } = await supabaseAdmin
+      .from("partners")
+      .update(patch)
+      .eq("id", id)
+      .select("id, kind, name, logo_path, state, order_index, created_at")
+      .single();
+
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+    return res.json({ ok: true, partner: data });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// DELETE partner
+app.delete("/api/admin/partners/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabaseAdmin.from("partners").delete().eq("id", id);
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// =============================
+// ✅ Admin: Quiz Finish + Reset (NO AUTH - TEST ONLY)
+// =============================
+
+// Mark finished (called when quiz ends from frontend)
+app.post("/api/admin/quiz-control/finish", async (req, res) => {
+  try {
+    const { quiz_id } = req.body || {};
+    const quizId = String(quiz_id || "").trim();
+
+    // إذا ما تبعتش quiz_id نحاولو ناخذوه من quiz_control
+    let targetQuizId = quizId;
+    if (!targetQuizId) {
+      const { data: ctrl, error: cErr } = await supabaseAdmin
+        .from("quiz_control")
+        .select("active_quiz_id")
+        .eq("id", 1)
+        .maybeSingle();
+      if (cErr) return res.status(400).json({ ok: false, message: cErr.message });
+      targetQuizId = ctrl?.active_quiz_id || "";
+    }
+
+    if (!targetQuizId) {
+      return res.status(400).json({ ok: false, message: "No active quiz to finish" });
+    }
+
+    // 1) Update quiz_control
+    const { error: upErr } = await supabaseAdmin
+      .from("quiz_control")
+      .update({
+        status: "finished",
+        starts_at: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", 1);
+
+    if (upErr) return res.status(400).json({ ok: false, message: upErr.message });
+
+    // 2) (اختياري) Update quizzes.status
+    await supabaseAdmin
+      .from("quizzes")
+      .update({ status: "finished" })
+      .eq("id", targetQuizId);
+
+    return res.json({ ok: true, quiz_id: targetQuizId });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// Reset quiz data (delete answers/scores/players) + return control to NONE
+app.post("/api/admin/quiz-control/reset", async (req, res) => {
+  try {
+    const { quiz_id } = req.body || {};
+    const quizId = String(quiz_id || "").trim();
+    if (!quizId) return res.status(400).json({ ok: false, message: "Missing quiz_id" });
+
+    // 1) Delete gameplay data (order مهم لتفادي قيود FK)
+    // quiz_answers references choices/questions/users but by quiz_id so safe
+    const delAnswers = await supabaseAdmin.from("quiz_answers").delete().eq("quiz_id", quizId);
+    if (delAnswers.error) return res.status(400).json({ ok: false, message: delAnswers.error.message });
+
+    const delScores = await supabaseAdmin.from("quiz_scores").delete().eq("quiz_id", quizId);
+    if (delScores.error) return res.status(400).json({ ok: false, message: delScores.error.message });
+
+    const delPlayers = await supabaseAdmin.from("quiz_players").delete().eq("quiz_id", quizId);
+    if (delPlayers.error) return res.status(400).json({ ok: false, message: delPlayers.error.message });
+
+    // 2) رجّع quiz_control للحالة العادية
+    const { error: ctrlErr } = await supabaseAdmin
+      .from("quiz_control")
+      .update({
+        status: "none",
+        starts_at: null,
+        updated_at: new Date().toISOString(),
+        active_quiz_id: quizId, // نخليه محدد (اختياري) باش يبقى Active مختار
+      })
+      .eq("id", 1);
+
+    if (ctrlErr) return res.status(400).json({ ok: false, message: ctrlErr.message });
+
+    // 3) (اختياري) رجّع quizzes.status لـ draft
+    await supabaseAdmin.from("quizzes").update({ status: "draft" }).eq("id", quizId);
+
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
