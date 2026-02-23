@@ -8,7 +8,16 @@ import { supabaseAdmin } from "./supabaseAdmin.js";
 dotenv.config();
 
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    origin: [
+      "https://chuluquiz.onrender.com", // رابط الفرونت الحقيقي
+      "http://localhost:5173",          // للـ dev
+    ],
+    methods: ["GET", "POST", "PATCH", "PUT", "DELETE"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
 app.use(express.json());
 
 app.get("/api/health", (req, res) => {
