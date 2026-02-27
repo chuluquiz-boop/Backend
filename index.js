@@ -103,7 +103,7 @@ app.post("/api/login", async (req, res) => {
 
     const { data: user, error } = await supabaseAdmin
       .from("users")
-      .select("id, username, password_hash, role, state")
+      .select("id, username, phone, password_hash, role, state")
       .eq("username", username.trim())
       .maybeSingle();
 
@@ -154,6 +154,7 @@ app.post("/api/login", async (req, res) => {
       session_token: sessionRow.token, // ✅ هذا اللي سنستعمله لحفظ النتائج
       user_id: user.id,
       username: user.username,
+      phone: user.phone,
     });
   } catch (err) {
     return res.status(500).json({ ok: false, message: err?.message || "Server error" });
@@ -1179,6 +1180,7 @@ app.post("/api/admin/quiz-control/finish", async (req, res) => {
 });
 
 // Reset quiz data (delete answers/scores/players) + return control to NONE
+// Reset quiz data (delete answers/scores/players) + return control to NONE
 app.post("/api/admin/quiz-control/reset", async (req, res) => {
   try {
     const { quiz_id } = req.body || {};
@@ -1186,7 +1188,6 @@ app.post("/api/admin/quiz-control/reset", async (req, res) => {
     if (!quizId) return res.status(400).json({ ok: false, message: "Missing quiz_id" });
 
     // 1) Delete gameplay data (order مهم لتفادي قيود FK)
-    // quiz_answers references choices/questions/users but by quiz_id so safe
     const delAnswers = await supabaseAdmin.from("quiz_answers").delete().eq("quiz_id", quizId);
     if (delAnswers.error) return res.status(400).json({ ok: false, message: delAnswers.error.message });
 
@@ -1196,6 +1197,16 @@ app.post("/api/admin/quiz-control/reset", async (req, res) => {
     const delPlayers = await supabaseAdmin.from("quiz_players").delete().eq("quiz_id", quizId);
     if (delPlayers.error) return res.status(400).json({ ok: false, message: delPlayers.error.message });
 
+    // ✅ NEW: Reset lifelines usage (hint / 50-50)
+    // (هذا هو اللي ناقصك)
+    const delLifelines = await supabaseAdmin.from("quiz_lifelines").delete().eq("quiz_id", quizId);
+    if (delLifelines.error) {
+      return res.status(400).json({ ok: false, message: delLifelines.error.message });
+    }
+
+    // ✅ (اختياري) إذا عندك جدول عقوبات/ستريك/تايم آوت… امسحو هنا كذلك
+    // await supabaseAdmin.from("quiz_penalties").delete().eq("quiz_id", quizId);
+
     // 2) رجّع quiz_control للحالة العادية
     const { error: ctrlErr } = await supabaseAdmin
       .from("quiz_control")
@@ -1203,7 +1214,7 @@ app.post("/api/admin/quiz-control/reset", async (req, res) => {
         status: "none",
         starts_at: null,
         updated_at: new Date().toISOString(),
-        active_quiz_id: quizId, // نخليه محدد (اختياري) باش يبقى Active مختار
+        active_quiz_id: quizId, // اختياري
       })
       .eq("id", 1);
 
@@ -1213,6 +1224,490 @@ app.post("/api/admin/quiz-control/reset", async (req, res) => {
     await supabaseAdmin.from("quizzes").update({ status: "draft" }).eq("id", quizId);
 
     return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+async function getUserBySessionToken(session_token) {
+  const token = String(session_token || "").trim();
+  if (!token) return { error: "Missing session_token" };
+
+  const { data: sess, error: sErr } = await supabaseAdmin
+    .from("user_sessions")
+    .select("user_id")
+    .eq("token", token)
+    .maybeSingle();
+
+  if (sErr || !sess?.user_id) return { error: "جلسة غير صالحة" };
+
+  const { data: user, error: uErr } = await supabaseAdmin
+    .from("users")
+    .select("id, username, phone, password_hash")
+    .eq("id", sess.user_id)
+    .maybeSingle();
+
+  if (uErr || !user) return { error: "المستخدم غير موجود" };
+
+  return { user };
+}
+
+// ✅ Update username/phone مع تأكيد كلمة السر
+app.post("/api/me/update", async (req, res) => {
+  try {
+    const { session_token, current_password, username, phone } = req.body || {};
+
+    const { user, error } = await getUserBySessionToken(session_token);
+    if (error) return res.status(401).json({ ok: false, message: error });
+
+    const okPass = await bcrypt.compare(String(current_password || ""), user.password_hash);
+    if (!okPass) return res.status(403).json({ ok: false, message: "كلمة السر غير صحيحة" });
+
+    const patch = {};
+
+    if (typeof username === "string" && username.trim().length >= 2) {
+      // تأكد unique
+      const { data: exU } = await supabaseAdmin
+        .from("users")
+        .select("id")
+        .eq("username", username.trim())
+        .neq("id", user.id)
+        .maybeSingle();
+      if (exU) return res.status(409).json({ ok: false, message: "اسم المستخدم مستعمل مسبقاً" });
+
+      patch.username = username.trim();
+    }
+
+    if (typeof phone === "string") {
+      const phoneDigits = phone.replace(/\D/g, "");
+      if (phoneDigits.length !== 10) {
+        return res.status(400).json({ ok: false, message: "رقم الهاتف يجب أن يكون 10 أرقام" });
+      }
+
+      const { data: exP } = await supabaseAdmin
+        .from("users")
+        .select("id")
+        .eq("phone", phoneDigits)
+        .neq("id", user.id)
+        .maybeSingle();
+      if (exP) return res.status(409).json({ ok: false, message: "رقم الهاتف مسجل مسبقاً" });
+
+      patch.phone = phoneDigits;
+    }
+
+    if (Object.keys(patch).length === 0) {
+      return res.json({ ok: true, username: user.username, phone: user.phone });
+    }
+
+    const { error: upErr } = await supabaseAdmin.from("users").update(patch).eq("id", user.id);
+    if (upErr) return res.status(400).json({ ok: false, message: upErr.message });
+
+    return res.json({ ok: true, username: patch.username || user.username, phone: patch.phone || user.phone });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// ✅ Change password مع تأكيد كلمة السر
+app.post("/api/me/change-password", async (req, res) => {
+  try {
+    const { session_token, current_password, new_password } = req.body || {};
+
+    const { user, error } = await getUserBySessionToken(session_token);
+    if (error) return res.status(401).json({ ok: false, message: error });
+
+    const okPass = await bcrypt.compare(String(current_password || ""), user.password_hash);
+    if (!okPass) return res.status(403).json({ ok: false, message: "كلمة السر غير صحيحة" });
+
+    if (!new_password || String(new_password).length < 6) {
+      return res.status(400).json({ ok: false, message: "كلمة السر الجديدة يجب أن تكون 6 أحرف على الأقل" });
+    }
+
+    const hash = await bcrypt.hash(String(new_password), 12);
+    const { error: upErr } = await supabaseAdmin.from("users").update({ password_hash: hash }).eq("id", user.id);
+    if (upErr) return res.status(400).json({ ok: false, message: upErr.message });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// ✅ Delete account مع تأكيد كلمة السر
+app.post("/api/me/delete", async (req, res) => {
+  try {
+    const { session_token, current_password } = req.body || {};
+
+    const { user, error } = await getUserBySessionToken(session_token);
+    if (error) return res.status(401).json({ ok: false, message: error });
+
+    const okPass = await bcrypt.compare(String(current_password || ""), user.password_hash);
+    if (!okPass) return res.status(403).json({ ok: false, message: "كلمة السر غير صحيحة" });
+
+    // حذف البيانات المرتبطة (لتفادي مشاكل FK)
+    await supabaseAdmin.from("quiz_answers").delete().eq("user_id", user.id);
+    await supabaseAdmin.from("quiz_scores").delete().eq("user_id", user.id);
+    await supabaseAdmin.from("quiz_players").delete().eq("user_id", user.id);
+    await supabaseAdmin.from("user_sessions").delete().eq("user_id", user.id);
+
+    const { error: delErr } = await supabaseAdmin.from("users").delete().eq("id", user.id);
+    if (delErr) return res.status(400).json({ ok: false, message: delErr.message });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// ✅ Me: تحقق من session_token وارجع معلومات المستخدم + state
+app.post("/api/me", async (req, res) => {
+  try {
+    // token يجي يا من body يا من Authorization: Bearer <token>
+    const auth = String(req.headers.authorization || "");
+    const bearer = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+    const bodyToken = String(req.body?.session_token || "").trim();
+    const token = bearer || bodyToken;
+
+    if (!token) return res.status(400).json({ ok: false, message: "Missing session_token" });
+
+    const nowIso = new Date().toISOString();
+
+    const { data: sess, error } = await supabaseAdmin
+      .from("user_sessions")
+      .select("token, user_id, expires_at, users:users(id, username, role, state)")
+      .eq("token", token)
+      .gt("expires_at", nowIso)
+      .maybeSingle();
+
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+    if (!sess?.users) return res.status(401).json({ ok: false, message: "Session invalid" });
+
+    return res.json({
+      ok: true,
+      user: {
+        id: sess.users.id,
+        username: sess.users.username,
+        role: sess.users.role,
+        state: sess.users.state,
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// ===============================
+// ✅ Quiz Gameplay API (server-authoritative)
+// - points: level_id => 1/2/3 بدل 10/20/30
+// - penalty: خطأين متتاليين => -1
+// - timeout: بدون إجابة => -1
+// - lifelines: hint مرة واحدة + 50/50 مرة واحدة
+// ===============================
+
+function pointsFromLevelId(levelId) {
+  const lv = Number(levelId);
+  if (lv === 1) return 1;
+  if (lv === 2) return 2;
+  if (lv === 3) return 3;
+  // fallback لأي مستوى آخر
+  return 1;
+}
+
+async function getScoreRow(quizId, userId) {
+  const { data, error } = await supabaseAdmin
+    .from("quiz_scores")
+    .select("score")
+    .eq("quiz_id", quizId)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data?.score ?? 0;
+}
+
+async function setScore(quizId, userId, newScore) {
+  const score = Math.max(0, Math.floor(Number(newScore) || 0)); // نخليها ما تنزلش تحت 0
+  const { error } = await supabaseAdmin
+    .from("quiz_scores")
+    .upsert(
+      { quiz_id: quizId, user_id: userId, score, updated_at: new Date().toISOString() },
+      { onConflict: "quiz_id,user_id" }
+    );
+
+  if (error) throw error;
+  return score;
+}
+
+// ✅ Submit answer عبر السيرفر (بدل RPC مباشرة)
+// body: { session_token, quiz_id, question_id, choice_id }
+app.post("/api/quiz/answer", async (req, res) => {
+  try {
+    const { session_token, quiz_id, question_id, choice_id } = req.body || {};
+
+    const quizId = String(quiz_id || "").trim();
+    const qid = String(question_id || "").trim();
+    const cid = String(choice_id || "").trim();
+
+    if (!quizId || !qid || !cid) {
+      return res.status(400).json({ ok: false, message: "Missing quiz_id/question_id/choice_id" });
+    }
+
+    const { user, error } = await getUserBySessionToken(session_token);
+    if (error) return res.status(401).json({ ok: false, message: error });
+
+    // ✅ إذا جاوب نفس السؤال قبل (unique constraint) نرجع نفس النتيجة بدون ما نكرر
+    const { data: existing, error: exErr } = await supabaseAdmin
+      .from("quiz_answers")
+      .select("is_correct, points_awarded")
+      .eq("quiz_id", quizId)
+      .eq("question_id", qid)
+      .eq("user_id", user.id)
+      .maybeSingle();
+
+    if (exErr) return res.status(400).json({ ok: false, message: exErr.message });
+
+    if (existing) {
+      const total = await getScoreRow(quizId, user.id);
+      return res.json({
+        ok: true,
+        already_answered: true,
+        is_correct: !!existing.is_correct,
+        points_awarded: existing.points_awarded ?? 0,
+        penalty: 0,
+        total_score: total,
+      });
+    }
+
+    // ✅ جلب level_id للسؤال
+    const { data: qRow, error: qErr } = await supabaseAdmin
+      .from("questions")
+      .select("id, level_id")
+      .eq("id", qid)
+      .eq("quiz_id", quizId)
+      .maybeSingle();
+
+    if (qErr) return res.status(400).json({ ok: false, message: qErr.message });
+    if (!qRow) return res.status(404).json({ ok: false, message: "Question not found" });
+
+    const basePoints = pointsFromLevelId(qRow.level_id);
+
+    // ✅ جلب هل الاختيار صحيح
+    const { data: cRow, error: cErr } = await supabaseAdmin
+      .from("choices")
+      .select("id, is_correct")
+      .eq("id", cid)
+      .eq("question_id", qid)
+      .maybeSingle();
+
+    if (cErr) return res.status(400).json({ ok: false, message: cErr.message });
+    if (!cRow) return res.status(404).json({ ok: false, message: "Choice not found" });
+
+    const isCorrect = !!cRow.is_correct;
+    const pointsAwarded = isCorrect ? basePoints : 0;
+
+    // ✅ penalty: إذا خطأين متتاليين (حسب آخر إجابة مسجلة)
+    let penalty = 0;
+    if (!isCorrect) {
+      const { data: lastAns, error: lastErr } = await supabaseAdmin
+        .from("quiz_answers")
+        .select("is_correct, answered_at")
+        .eq("quiz_id", quizId)
+        .eq("user_id", user.id)
+        .order("answered_at", { ascending: false })
+        .limit(1);
+
+      if (lastErr) return res.status(400).json({ ok: false, message: lastErr.message });
+
+      const prevWasWrong = (lastAns && lastAns[0]) ? !lastAns[0].is_correct : false;
+      if (prevWasWrong) penalty = -1;
+    }
+
+    // ✅ insert answer
+    const { error: insErr } = await supabaseAdmin.from("quiz_answers").insert({
+      quiz_id: quizId,
+      question_id: qid,
+      user_id: user.id,
+      choice_id: cid,
+      is_correct: isCorrect,
+      points_awarded: pointsAwarded,
+      answered_at: new Date().toISOString(),
+    });
+
+    if (insErr) return res.status(400).json({ ok: false, message: insErr.message });
+
+    // ✅ update score (delta = points + penalty)
+    const current = await getScoreRow(quizId, user.id);
+    const total = await setScore(quizId, user.id, current + pointsAwarded + penalty);
+
+    return res.json({
+      ok: true,
+      already_answered: false,
+      is_correct: isCorrect,
+      points_awarded: pointsAwarded,
+      penalty,
+      total_score: total,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// ✅ Timeout penalty: إذا ما جاوبش السؤال و انتهى الوقت => -1
+// body: { session_token, quiz_id, question_id }
+app.post("/api/quiz/timeout", async (req, res) => {
+  try {
+    const { session_token, quiz_id, question_id } = req.body || {};
+    const quizId = String(quiz_id || "").trim();
+    const qid = String(question_id || "").trim();
+
+    if (!quizId || !qid) {
+      return res.status(400).json({ ok: false, message: "Missing quiz_id/question_id" });
+    }
+
+    const { user, error } = await getUserBySessionToken(session_token);
+    if (error) return res.status(401).json({ ok: false, message: error });
+
+    // إذا كان جاوب بالفعل => ما نخصموش
+    const { data: existing, error: exErr } = await supabaseAdmin
+      .from("quiz_answers")
+      .select("id")
+      .eq("quiz_id", quizId)
+      .eq("question_id", qid)
+      .eq("user_id", user.id)
+      .maybeSingle();
+
+    if (exErr) return res.status(400).json({ ok: false, message: exErr.message });
+
+    if (existing) {
+      const total = await getScoreRow(quizId, user.id);
+      return res.json({ ok: true, skipped: true, penalty: 0, total_score: total });
+    }
+
+    const current = await getScoreRow(quizId, user.id);
+    const total = await setScore(quizId, user.id, current - 1);
+
+    return res.json({ ok: true, skipped: false, penalty: -1, total_score: total });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// ✅ Lifeline: Hint مرة واحدة في الكويز كامل
+// body: { session_token, quiz_id, question_id }
+app.post("/api/quiz/use-hint", async (req, res) => {
+  try {
+    const { session_token, quiz_id, question_id } = req.body || {};
+    const quizId = String(quiz_id || "").trim();
+    const qid = String(question_id || "").trim();
+
+    if (!quizId || !qid) return res.status(400).json({ ok: false, message: "Missing quiz_id/question_id" });
+
+    const { user, error } = await getUserBySessionToken(session_token);
+    if (error) return res.status(401).json({ ok: false, message: error });
+
+    // اقرأ/أنشئ سطر lifelines
+    const { data: row, error: rErr } = await supabaseAdmin
+      .from("quiz_lifelines")
+      .select("hint_used")
+      .eq("quiz_id", quizId)
+      .eq("user_id", user.id)
+      .maybeSingle();
+
+    if (rErr) return res.status(400).json({ ok: false, message: rErr.message });
+
+    if (row?.hint_used) {
+      return res.status(409).json({ ok: false, message: "تم استعمال التلميح مسبقاً في هذا الكويز." });
+    }
+
+    // جلب hint من السؤال
+    const { data: qRow, error: qErr } = await supabaseAdmin
+      .from("questions")
+      .select("hint")
+      .eq("id", qid)
+      .eq("quiz_id", quizId)
+      .maybeSingle();
+
+    if (qErr) return res.status(400).json({ ok: false, message: qErr.message });
+    const hint = String(qRow?.hint || "").trim();
+    if (!hint) return res.status(404).json({ ok: false, message: "لا يوجد تلميح لهذا السؤال." });
+
+    // حدّث lifelines
+    const { error: upErr } = await supabaseAdmin
+      .from("quiz_lifelines")
+      .upsert(
+        {
+          quiz_id: quizId,
+          user_id: user.id,
+          hint_used: true,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "quiz_id,user_id" }
+      );
+
+    if (upErr) return res.status(400).json({ ok: false, message: upErr.message });
+
+    return res.json({ ok: true, hint });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// ✅ Lifeline: 50/50 مرة واحدة (يحذف خيارين خاطئين)
+// body: { session_token, quiz_id, question_id }
+app.post("/api/quiz/use-fifty", async (req, res) => {
+  try {
+    const { session_token, quiz_id, question_id } = req.body || {};
+    const quizId = String(quiz_id || "").trim();
+    const qid = String(question_id || "").trim();
+
+    if (!quizId || !qid) return res.status(400).json({ ok: false, message: "Missing quiz_id/question_id" });
+
+    const { user, error } = await getUserBySessionToken(session_token);
+    if (error) return res.status(401).json({ ok: false, message: error });
+
+    const { data: row, error: rErr } = await supabaseAdmin
+      .from("quiz_lifelines")
+      .select("fifty_used")
+      .eq("quiz_id", quizId)
+      .eq("user_id", user.id)
+      .maybeSingle();
+
+    if (rErr) return res.status(400).json({ ok: false, message: rErr.message });
+
+    if (row?.fifty_used) {
+      return res.status(409).json({ ok: false, message: "تم استعمال حذف خيارين مسبقاً في هذا الكويز." });
+    }
+
+    // جلب الخيارات مع is_correct (لازم admin)
+    const { data: choices, error: cErr } = await supabaseAdmin
+      .from("choices")
+      .select("id, is_correct")
+      .eq("question_id", qid);
+
+    if (cErr) return res.status(400).json({ ok: false, message: cErr.message });
+
+    const wrong = (choices || []).filter((c) => !c.is_correct).map((c) => c.id);
+    if (wrong.length < 2) return res.status(400).json({ ok: false, message: "لا يمكن حذف خيارين لهذا السؤال." });
+
+    // اختر 2 عشوائيين
+    wrong.sort(() => Math.random() - 0.5);
+    const hide_choice_ids = wrong.slice(0, 2);
+
+    // حدّث lifelines
+    const { error: upErr } = await supabaseAdmin
+      .from("quiz_lifelines")
+      .upsert(
+        {
+          quiz_id: quizId,
+          user_id: user.id,
+          fifty_used: true,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "quiz_id,user_id" }
+      );
+
+    if (upErr) return res.status(400).json({ ok: false, message: upErr.message });
+
+    return res.json({ ok: true, hide_choice_ids });
   } catch (err) {
     return res.status(500).json({ ok: false, message: err?.message || "Server error" });
   }
