@@ -1762,5 +1762,165 @@ app.post("/api/admin/quiz-control/seed-lifelines", async (req, res) => {
     return res.status(500).json({ ok: false, message: err?.message || "Server error" });
   }
 });
+// =============================
+// ✅ Admin: Rules CRUD + Copy — TEST ONLY / NO AUTH
+// Table: rules (id, quiz_id, title, content, updated_at)
+// =============================
+
+// List rules (optional quiz_id)
+app.get("/api/admin/rules", async (req, res) => {
+  try {
+    const quizId = String(req.query.quiz_id || "").trim(); // "" => all, "null" => general
+
+    let q = supabaseAdmin
+      .from("rules")
+      .select("id, quiz_id, title, content, updated_at")
+      .order("updated_at", { ascending: false });
+
+    if (quizId) {
+      if (quizId === "null") q = q.is("quiz_id", null);
+      else q = q.eq("quiz_id", quizId);
+    }
+
+    const { data, error } = await q;
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+    return res.json({ ok: true, rules: data || [] });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// Create rule
+app.post("/api/admin/rules", async (req, res) => {
+  try {
+    const { quiz_id, title, content } = req.body || {};
+
+    if (!content || !String(content).trim()) {
+      return res.status(400).json({ ok: false, message: "content مطلوب" });
+    }
+
+    const payload = {
+      quiz_id: quiz_id ?? null,
+      title: title ?? null,
+      content: String(content),
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabaseAdmin
+      .from("rules")
+      .insert(payload)
+      .select("id, quiz_id, title, content, updated_at")
+      .maybeSingle();
+
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+    return res.json({ ok: true, rule: data });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// Update rule
+app.put("/api/admin/rules/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    const { quiz_id, title, content } = req.body || {};
+
+    if (!id) return res.status(400).json({ ok: false, message: "Missing id" });
+    if (content != null && !String(content).trim()) {
+      return res.status(400).json({ ok: false, message: "content لا يمكن أن يكون فارغ" });
+    }
+
+    const patch = {
+      updated_at: new Date().toISOString(),
+    };
+    if (quiz_id !== undefined) patch.quiz_id = quiz_id ?? null;
+    if (title !== undefined) patch.title = title ?? null;
+    if (content !== undefined) patch.content = String(content);
+
+    const { data, error } = await supabaseAdmin
+      .from("rules")
+      .update(patch)
+      .eq("id", id)
+      .select("id, quiz_id, title, content, updated_at")
+      .maybeSingle();
+
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+    return res.json({ ok: true, rule: data });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// Delete rule
+app.delete("/api/admin/rules/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ ok: false, message: "Missing id" });
+
+    const { error } = await supabaseAdmin.from("rules").delete().eq("id", id);
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// Copy rule from quiz -> quiz (with overwrite option)
+app.post("/api/admin/rules/copy", async (req, res) => {
+  try {
+    const { from_quiz_id, to_quiz_id, overwrite } = req.body || {};
+
+    // from_quiz_id / to_quiz_id can be null (general)
+    // we accept: null or string uuid
+    const fromId = from_quiz_id ?? null;
+    const toId = to_quiz_id ?? null;
+
+    // 1) fetch latest rule from source
+    let srcQ = supabaseAdmin
+      .from("rules")
+      .select("id, quiz_id, title, content, updated_at")
+      .order("updated_at", { ascending: false })
+      .limit(1);
+
+    if (fromId === null) srcQ = srcQ.is("quiz_id", null);
+    else srcQ = srcQ.eq("quiz_id", fromId);
+
+    const { data: srcRows, error: srcErr } = await srcQ;
+    if (srcErr) return res.status(400).json({ ok: false, message: srcErr.message });
+    const src = (srcRows && srcRows[0]) || null;
+
+    if (!src) return res.status(404).json({ ok: false, message: "لا توجد قاعدة في المصدر" });
+
+    // 2) overwrite: delete target rules
+    if (overwrite) {
+      let delQ = supabaseAdmin.from("rules").delete();
+      if (toId === null) delQ = delQ.is("quiz_id", null);
+      else delQ = delQ.eq("quiz_id", toId);
+
+      const { error: delErr } = await delQ;
+      if (delErr) return res.status(400).json({ ok: false, message: delErr.message });
+    }
+
+    // 3) insert new rule for target
+    const payload = {
+      quiz_id: toId,
+      title: src.title ?? null,
+      content: src.content,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data: created, error: insErr } = await supabaseAdmin
+      .from("rules")
+      .insert(payload)
+      .select("id, quiz_id, title, content, updated_at")
+      .maybeSingle();
+
+    if (insErr) return res.status(400).json({ ok: false, message: insErr.message });
+    return res.json({ ok: true, rule: created });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
