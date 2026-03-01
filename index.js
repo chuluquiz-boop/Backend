@@ -378,22 +378,25 @@ app.get("/api/admin/leaderboard", async (req, res) => {
     if (!quizId) return res.status(400).json({ ok: false, message: "Missing quiz_id" });
 
     const { data, error } = await supabaseAdmin
-      .from("quiz_scores")
-      .select("user_id, score, updated_at, users:users(id, username, phone)")
+      .from("quiz_leaderboard")
+      .select("user_id, username, score, lifelines_used, avg_correct_ms")
       .eq("quiz_id", quizId)
       .order("score", { ascending: false })
-      .order("updated_at", { ascending: true })
+      .order("lifelines_used", { ascending: true })
+      .order("avg_correct_ms", { ascending: true })
+      .order("user_id", { ascending: true })
       .limit(500);
+
 
     if (error) return res.status(400).json({ ok: false, message: error.message });
 
     const rows = (data || []).map((r, i) => ({
       rank: i + 1,
       user_id: r.user_id,
-      username: r?.users?.username || "—",
-      phone: r?.users?.phone || "—",
+      username: r.username || "—",
       score: r.score ?? 0,
-      updated_at: r.updated_at,
+      lifelines_used: r.lifelines_used ?? 0,
+      avg_correct_ms: r.avg_correct_ms ?? null,
     }));
 
     return res.json({ ok: true, rows });
@@ -1441,7 +1444,7 @@ async function setScore(quizId, userId, newScore) {
 // body: { session_token, quiz_id, question_id, choice_id }
 app.post("/api/quiz/answer", async (req, res) => {
   try {
-    const { session_token, quiz_id, question_id, choice_id } = req.body || {};
+    const { session_token, quiz_id, question_id, choice_id, reaction_ms } = req.body || {};
 
     const quizId = String(quiz_id || "").trim();
     const qid = String(question_id || "").trim();
@@ -1450,7 +1453,14 @@ app.post("/api/quiz/answer", async (req, res) => {
     if (!quizId || !qid || !cid) {
       return res.status(400).json({ ok: false, message: "Missing quiz_id/question_id/choice_id" });
     }
-
+    // ✅ reaction_ms: نحولو لرقم ونقصّوه لحدود معقولة (0..5 دقائق)
+    let reactionMs = null;
+    if (reaction_ms !== undefined && reaction_ms !== null) {
+      const n = Number(reaction_ms);
+      if (Number.isFinite(n)) {
+        reactionMs = Math.max(0, Math.min(300000, Math.floor(n))); // 0 إلى 300000ms
+      }
+    }
     const { user, error } = await getUserBySessionToken(session_token);
     if (error) return res.status(401).json({ ok: false, message: error });
 
@@ -1530,6 +1540,7 @@ app.post("/api/quiz/answer", async (req, res) => {
       is_correct: isCorrect,
       points_awarded: pointsAwarded,
       answered_at: new Date().toISOString(),
+      reaction_ms: reactionMs, // ✅ الجديد
     });
 
     if (insErr) return res.status(400).json({ ok: false, message: insErr.message });
@@ -1581,7 +1592,22 @@ app.post("/api/quiz/timeout", async (req, res) => {
       const total = await getScoreRow(quizId, user.id);
       return res.json({ ok: true, skipped: true, penalty: 0, total_score: total });
     }
+    // ✅ سجّل timeout في quiz_answers
+    const { error: insErr } = await supabaseAdmin.from("quiz_answers").insert({
+      quiz_id: quizId,
+      question_id: qid,
+      user_id: user.id,
+      choice_id: null,          // ماجاوبش
+      is_correct: false,        // timeout يعتبر خطأ
+      points_awarded: 0,
+      reaction_ms: null,        // ماعندناش وقت رد لأنه ما ضغطش
+      is_timeout: true,         // ✅ مهم
+      answered_at: new Date().toISOString(),
+    });
 
+    if (insErr) {
+      return res.status(400).json({ ok: false, message: insErr.message });
+    }
     const current = await getScoreRow(quizId, user.id);
     const total = await setScore(quizId, user.id, current - 1);
 
