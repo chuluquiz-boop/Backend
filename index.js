@@ -24,142 +24,9 @@ app.get("/api/health", (req, res) => {
   res.json({ ok: true });
 });
 
-// ✅ Register بدون Auth (Hash في السيرفر)
-app.post("/api/register", async (req, res) => {
-  try {
-    const { username, phone, password } = req.body || {};
 
-    if (!username || username.trim().length < 2) {
-      return res.status(400).json({ ok: false, message: "اسم المستخدم غير صالح" });
-    }
 
-    const phoneDigits = String(phone || "").replace(/\D/g, "");
-    if (phoneDigits.length !== 10) {
-      return res.status(400).json({ ok: false, message: "رقم الهاتف يجب أن يكون 10 أرقام" });
-    }
 
-    if (!password || String(password).length < 6) {
-      return res.status(400).json({ ok: false, message: "كلمة السر يجب أن تكون 6 أحرف على الأقل" });
-    }
-
-    // تأكد من عدم وجود نفس الهاتف
-    const { data: existing, error: exErr } = await supabaseAdmin
-      .from("users")
-      .select("id")
-      .eq("phone", phoneDigits)
-      .maybeSingle();
-
-    if (exErr) throw exErr;
-    if (existing) {
-      return res.status(409).json({ ok: false, message: "رقم الهاتف مسجل مسبقاً" });
-    }
-
-    // (اختياري) تأكد من عدم وجود نفس username
-    const { data: existingUser, error: exErr2 } = await supabaseAdmin
-      .from("users")
-      .select("id")
-      .eq("username", username.trim())
-      .maybeSingle();
-
-    if (exErr2) throw exErr2;
-    if (existingUser) {
-      return res.status(409).json({ ok: false, message: "اسم المستخدم مستعمل مسبقاً" });
-    }
-
-    const passwordHash = await bcrypt.hash(password, 12);
-
-    const { error: insErr } = await supabaseAdmin.from("users").insert({
-      username: username.trim(),
-      phone: phoneDigits,
-      password_hash: passwordHash,
-      role: "user",
-      state: 0, // 👈 طلب قيد المراجعة
-    });
-
-    if (insErr) throw insErr;
-
-    // رسالة احترافية مثل ما طلبت
-    return res.json({
-      ok: true,
-      message: "تم تقديم طلب تسجيلك بنجاح ✅\nيرجى الانتظار حتى تتم الموافقة عليه.\nشكرًا لك.",
-    });
-  } catch (err) {
-    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
-  }
-});
-
-// ✅ Login: لازم username + password صحيحين + state = 1
-app.post("/api/login", async (req, res) => {
-  try {
-    const { username, password } = req.body || {};
-
-    if (!username || username.trim().length < 2) {
-      return res.status(400).json({ ok: false, message: "اسم المستخدم غير صالح" });
-    }
-
-    if (!password || String(password).length < 6) {
-      return res.status(400).json({ ok: false, message: "كلمة السر غير صالحة" });
-    }
-
-    const { data: user, error } = await supabaseAdmin
-      .from("users")
-      .select("id, username, phone, password_hash, role, state")
-      .eq("username", username.trim())
-      .maybeSingle();
-
-    if (error || !user) {
-      return res.status(401).json({ ok: false, message: "اسم المستخدم أو كلمة السر غير صحيحة." });
-    }
-
-    // شرط الموافقة
-    if (Number(user.state) !== 1) {
-      return res.status(403).json({
-        ok: false,
-        message: "تم تقديم طلبك، يرجى الانتظار حتى تتم الموافقة من الإدارة.",
-      });
-    }
-
-    const okPass = await bcrypt.compare(password, user.password_hash);
-    if (!okPass) {
-      return res.status(401).json({ ok: false, message: "اسم المستخدم أو كلمة السر غير صحيحة." });
-    }
-
-    // JWT token
-    const secret = process.env.JWT_SECRET;
-    if (!secret) {
-      return res.status(500).json({ ok: false, message: "JWT_SECRET غير موجود في .env" });
-    }
-
-    const token = jwt.sign(
-      { uid: user.id, username: user.username, role: user.role },
-      secret,
-      { expiresIn: "7d" }
-    );
-
-    // ✅ إنشاء session_token في Supabase (user_sessions)
-    const { data: sessionRow, error: sessErr } = await supabaseAdmin
-      .from("user_sessions")
-      .insert({ user_id: user.id })
-      .select("token")
-      .single();
-
-    if (sessErr || !sessionRow?.token) {
-      return res.status(500).json({ ok: false, message: "فشل إنشاء جلسة المشاركة" });
-    }
-
-    return res.json({
-      ok: true,
-      message: "تم تسجيل الدخول بنجاح ✅",
-      token, // JWT كما كان
-      session_token: sessionRow.token, // ✅ هذا اللي سنستعمله لحفظ النتائج
-      user_id: user.id,
-      username: user.username,
-      phone: user.phone,
-    });
-  } catch (err) {
-    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
-  }
-});
 // ✅ Admin Login: لازم role = admin و state = 1
 app.post("/api/admin/login", async (req, res) => {
   try {
@@ -1962,7 +1829,34 @@ app.post("/api/quiz/join", async (req, res) => {
 
     // guest_key يضمن uniqueness لو حبيت تمنع تكرار نفس الجهاز (اختياري)
     const guestKey = `q_${quizId}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    // ✅ قبل create guest user: امنع تكرار نفس الاسم في نفس الكويز
+    // نتحقق case-insensitive
+    const { data: sameNameUsers, error: nErr } = await supabaseAdmin
+      .from("users")
+      .select("id")
+      .ilike("username", name) // exact match لكن case-insensitive (بدون %)
+      .limit(500);
 
+    if (nErr) return res.status(400).json({ ok: false, message: nErr.message });
+
+    const ids = (sameNameUsers || []).map((u) => u.id);
+    if (ids.length) {
+      const { data: already, error: pErr } = await supabaseAdmin
+        .from("quiz_players")
+        .select("id")
+        .eq("quiz_id", quizId)
+        .in("user_id", ids)
+        .limit(1);
+
+      if (pErr) return res.status(400).json({ ok: false, message: pErr.message });
+
+      if (already && already.length) {
+        return res.status(409).json({
+          ok: false,
+          message: "تم اختيار هذا الاسم مسبقاً في هذا الكويز. اختر اسمًا آخر.",
+        });
+      }
+    }
     // 1) create guest user
     const { data: user, error: uErr } = await supabaseAdmin
       .from("users")
