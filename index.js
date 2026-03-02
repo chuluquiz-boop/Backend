@@ -221,7 +221,7 @@ app.get("/api/admin/users", async (req, res) => {
   try {
     const { data, error } = await supabaseAdmin
       .from("users")
-      .select("id, username, phone, role, state, created_at")
+      .select("id, username, phone, role, state, created_at, is_guest") // ← أضف is_guest هنا
       .order("created_at", { ascending: false });
 
     if (error) return res.status(400).json({ ok: false, message: error.message });
@@ -1944,6 +1944,83 @@ app.post("/api/admin/rules/copy", async (req, res) => {
 
     if (insErr) return res.status(400).json({ ok: false, message: insErr.message });
     return res.json({ ok: true, rule: created });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+// POST /api/quiz/join
+// body: { quiz_id, username }
+// returns: { session_token, user_id, username, expires_at }
+app.post("/api/quiz/join", async (req, res) => {
+  try {
+    const { quiz_id, username } = req.body || {};
+    const quizId = String(quiz_id || "").trim();
+    const name = String(username || "").trim();
+
+    if (!quizId) return res.status(400).json({ ok: false, message: "Missing quiz_id" });
+    if (name.length < 2) return res.status(400).json({ ok: false, message: "اسم غير صالح" });
+
+    // guest_key يضمن uniqueness لو حبيت تمنع تكرار نفس الجهاز (اختياري)
+    const guestKey = `q_${quizId}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+
+    // 1) create guest user
+    const { data: user, error: uErr } = await supabaseAdmin
+      .from("users")
+      .insert({
+        username: name,
+        phone: null,             // ✅ ماكانش هاتف
+        password_hash: "",       // ✅ فارغة
+        role: "user",
+        state: 1,                // ✅ مفعل مباشرة
+        is_guest: true,
+        guest_key: guestKey,
+      })
+      .select("id, username")
+      .single();
+
+    if (uErr) return res.status(400).json({ ok: false, message: uErr.message });
+
+    // 2) create short session (مثلا 6 ساعات)
+    const expiresAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
+
+    const { data: sess, error: sErr } = await supabaseAdmin
+      .from("user_sessions")
+      .insert({ user_id: user.id, expires_at: expiresAt })
+      .select("token, expires_at")
+      .single();
+
+    if (sErr) return res.status(400).json({ ok: false, message: sErr.message });
+
+    // 3) (اختياري) insert into quiz_players مباشرة
+    await supabaseAdmin.from("quiz_players").upsert(
+      { quiz_id: quizId, user_id: user.id },
+      { onConflict: "quiz_id,user_id" }
+    );
+
+    return res.json({
+      ok: true,
+      session_token: sess.token,
+      user_id: user.id,
+      username: user.username,
+      expires_at: sess.expires_at,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// ✅ Admin: Delete all guests (TEST ONLY / NO AUTH مثل باقي الأدمن عندك)
+app.delete("/api/admin/guests", async (req, res) => {
+  try {
+    // اختياري: ما نحذفوش admins بالغلط + نحذف غير role=user
+    const { data, error } = await supabaseAdmin
+      .from("users")
+      .delete()
+      .eq("is_guest", true)
+      .eq("role", "user");
+
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+    return res.json({ ok: true });
   } catch (err) {
     return res.status(500).json({ ok: false, message: err?.message || "Server error" });
   }
