@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { supabaseAdmin } from "./supabaseAdmin.js";
+import { fcm } from "./firebaseAdmin.js";
 
 dotenv.config();
 
@@ -1915,6 +1916,67 @@ app.delete("/api/admin/guests", async (req, res) => {
 
     if (error) return res.status(400).json({ ok: false, message: error.message });
     return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+// ✅ Register push token
+app.post("/api/push/register", async (req, res) => {
+  try {
+    const { user_id, token } = req.body || {};
+    const uid = Number(user_id);
+    const t = String(token || "").trim();
+
+    if (!uid || Number.isNaN(uid)) return res.status(400).json({ ok: false, message: "Invalid user_id" });
+    if (!t || t.length < 20) return res.status(400).json({ ok: false, message: "Invalid token" });
+
+    const { error } = await supabaseAdmin
+      .from("user_push_tokens")
+      .upsert({ user_id: uid, token: t }, { onConflict: "token" });
+
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+app.post("/api/admin/push/broadcast", async (req, res) => {
+  try {
+    const { title, body } = req.body || {};
+    const t = String(title || "ChuluQuiz").trim();
+    const b = String(body || "").trim();
+    if (!b) return res.status(400).json({ ok: false, message: "body required" });
+
+    // جيب كل tokens
+    const { data, error } = await supabaseAdmin
+      .from("user_push_tokens")
+      .select("token")
+      .limit(5000);
+
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+
+    const tokens = (data || []).map(x => x.token).filter(Boolean);
+    if (!tokens.length) return res.json({ ok: true, sent: 0 });
+
+    // send multicast
+    const resp = await fcm.sendEachForMulticast({
+      tokens,
+      notification: { title: t, body: b },
+    });
+
+    // حذف التوكينات اللي ولات غير صالحة
+    const bad = [];
+    resp.responses.forEach((r, i) => {
+      if (!r.success) bad.push(tokens[i]);
+    });
+
+    if (bad.length) {
+      await supabaseAdmin.from("user_push_tokens").delete().in("token", bad);
+    }
+
+    return res.json({ ok: true, sent: resp.successCount, failed: resp.failureCount, removed_bad: bad.length });
   } catch (err) {
     return res.status(500).json({ ok: false, message: err?.message || "Server error" });
   }
