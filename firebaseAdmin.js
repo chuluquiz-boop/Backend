@@ -1,9 +1,13 @@
 // firebaseAdmin.js
 import admin from "firebase-admin";
+import fs from "fs";
+import path from "path";
 
-const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-if (!raw) throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON missing");
+const filePath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH
+  ? process.env.FIREBASE_SERVICE_ACCOUNT_PATH
+  : path.join(process.cwd(), "serviceAccount.json");
 
+const raw = fs.readFileSync(filePath, "utf8");
 const serviceAccount = JSON.parse(raw);
 
 if (!admin.apps.length) {
@@ -12,5 +16,4 @@ if (!admin.apps.length) {
   });
 }
 
-// ✅ هذا هو المهم: export باسم fcm
 export const fcm = admin.messaging();

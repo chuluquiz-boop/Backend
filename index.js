@@ -1921,64 +1921,90 @@ app.delete("/api/admin/guests", async (req, res) => {
   }
 });
 // ✅ Register push token
+// =============================
+// ✅ Push Tokens (FCM) — register
+// =============================
 app.post("/api/push/register", async (req, res) => {
   try {
-    const { user_id, token } = req.body || {};
-    const uid = Number(user_id);
-    const t = String(token || "").trim();
+    const { token, user_id } = req.body || {};
 
-    if (!uid || Number.isNaN(uid)) return res.status(400).json({ ok: false, message: "Invalid user_id" });
-    if (!t || t.length < 20) return res.status(400).json({ ok: false, message: "Invalid token" });
+    const t = String(token || "").trim();
+    if (!t) return res.status(400).json({ ok: false, message: "Missing token" });
+
+    const uid = user_id == null ? null : Number(user_id);
 
     const { error } = await supabaseAdmin
-      .from("user_push_tokens")
-      .upsert({ user_id: uid, token: t }, { onConflict: "token" });
+      .from("push_tokens")
+      .upsert(
+        {
+          token: t,
+          user_id: Number.isFinite(uid) ? uid : null,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "token" }
+      );
 
     if (error) return res.status(400).json({ ok: false, message: error.message });
 
     return res.json({ ok: true });
-  } catch (err) {
-    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e?.message || "Server error" });
   }
 });
 
-app.post("/api/admin/push/broadcast", async (req, res) => {
+// =============================
+// ✅ Admin - Send push notification (broadcast)
+// =============================
+app.post("/api/admin/push/send", async (req, res) => {
   try {
-    const { title, body } = req.body || {};
-    const t = String(title || "ChuluQuiz").trim();
-    const b = String(body || "").trim();
-    if (!b) return res.status(400).json({ ok: false, message: "body required" });
+    const { title, body, url } = req.body || {};
 
-    // جيب كل tokens
+    const notifTitle = String(title || "ChuluQuiz").slice(0, 80);
+    const notifBody = String(body || "إشعار تجريبي ✅").slice(0, 200);
+
+    // نجبد كامل tokens (500/500 دفعات)
     const { data, error } = await supabaseAdmin
-      .from("user_push_tokens")
+      .from("push_tokens")
       .select("token")
-      .limit(5000);
+      .order("updated_at", { ascending: false })
+      .limit(500);
 
     if (error) return res.status(400).json({ ok: false, message: error.message });
 
-    const tokens = (data || []).map(x => x.token).filter(Boolean);
-    if (!tokens.length) return res.json({ ok: true, sent: 0 });
+    const tokens = (data || []).map((x) => x.token).filter(Boolean);
+    if (!tokens.length) return res.json({ ok: true, sent: 0, message: "No tokens found" });
 
-    // send multicast
     const resp = await fcm.sendEachForMulticast({
       tokens,
-      notification: { title: t, body: b },
+      notification: { title: notifTitle, body: notifBody },
+      data: url ? { url: String(url) } : {},
+      webpush: { notification: { icon: "/pwa-192.png" } },
     });
-
-    // حذف التوكينات اللي ولات غير صالحة
+    const details = resp.responses.map((r, i) => ({
+      i,
+      ok: r.success,
+      token_prefix: tokens[i]?.slice(0, 12),
+      error_code: r.error?.code || null,
+      error_message: r.error?.message || null,
+    }));
+    // حذف tokens invalid تلقائيًا (اختياري لكنه مفيد)
     const bad = [];
     resp.responses.forEach((r, i) => {
       if (!r.success) bad.push(tokens[i]);
     });
 
     if (bad.length) {
-      await supabaseAdmin.from("user_push_tokens").delete().in("token", bad);
+      await supabaseAdmin.from("push_tokens").delete().in("token", bad);
     }
 
-    return res.json({ ok: true, sent: resp.successCount, failed: resp.failureCount, removed_bad: bad.length });
-  } catch (err) {
-    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+    return res.json({
+      ok: true,
+      successCount: resp.successCount,
+      failureCount: resp.failureCount,
+      details,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e?.message || "Server error" });
   }
 });
 const PORT = process.env.PORT || 5000;
