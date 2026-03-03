@@ -2007,5 +2007,180 @@ app.post("/api/admin/push/send", async (req, res) => {
     return res.status(500).json({ ok: false, message: e?.message || "Server error" });
   }
 });
+// =============================
+// ✅ Admin: Scheduled Copy CRUD + Copy
+// Table: scheduled_copy (id, quiz_id, stat, state, slot, order_index, content, updated_at)
+// =============================
+
+// List scheduled_copy (optional quiz_id, optional stat)
+app.get("/api/admin/scheduled-copy", async (req, res) => {
+  try {
+    const quizId = String(req.query.quiz_id || "").trim(); // "null" => general
+    const statRaw = req.query.stat;
+
+    let q = supabaseAdmin
+      .from("scheduled_copy")
+      .select("id, quiz_id, stat, state, slot, order_index, content, updated_at")
+      .order("slot", { ascending: true })
+      .order("order_index", { ascending: true })
+      .order("updated_at", { ascending: false });
+
+    if (quizId) {
+      if (quizId === "null") q = q.is("quiz_id", null);
+      else q = q.eq("quiz_id", quizId);
+    }
+
+    if (statRaw != null && String(statRaw).trim() !== "") {
+      const st = Number(statRaw);
+      if (Number.isFinite(st)) q = q.eq("stat", st);
+    }
+
+    const { data, error } = await q;
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+    return res.json({ ok: true, rows: data || [] });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// Create
+app.post("/api/admin/scheduled-copy", async (req, res) => {
+  try {
+    const { quiz_id, stat, state, slot, order_index, content } = req.body || {};
+
+    if (!slot || !String(slot).trim()) {
+      return res.status(400).json({ ok: false, message: "slot مطلوب" });
+    }
+    if (!content || !String(content).trim()) {
+      return res.status(400).json({ ok: false, message: "content مطلوب" });
+    }
+
+    const payload = {
+      quiz_id: quiz_id ?? null,
+      stat: Number.isFinite(Number(stat)) ? Number(stat) : 1,
+      state: Number.isFinite(Number(state)) ? Number(state) : 1,
+      slot: String(slot),
+      order_index: Number.isFinite(Number(order_index)) ? Number(order_index) : 0,
+      content: String(content),
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabaseAdmin
+      .from("scheduled_copy")
+      .insert(payload)
+      .select("id, quiz_id, stat, state, slot, order_index, content, updated_at")
+      .maybeSingle();
+
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+    return res.json({ ok: true, row: data });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// Update
+app.put("/api/admin/scheduled-copy/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ ok: false, message: "Missing id" });
+
+    const { quiz_id, stat, state, slot, order_index, content } = req.body || {};
+
+    const patch = { updated_at: new Date().toISOString() };
+    if (quiz_id !== undefined) patch.quiz_id = quiz_id ?? null;
+    if (stat !== undefined) patch.stat = Number(stat);
+    if (state !== undefined) patch.state = Number(state);
+    if (slot !== undefined) patch.slot = String(slot);
+    if (order_index !== undefined) patch.order_index = Number(order_index);
+    if (content !== undefined) {
+      if (!String(content).trim()) return res.status(400).json({ ok: false, message: "content لا يمكن أن يكون فارغ" });
+      patch.content = String(content);
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from("scheduled_copy")
+      .update(patch)
+      .eq("id", id)
+      .select("id, quiz_id, stat, state, slot, order_index, content, updated_at")
+      .maybeSingle();
+
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+    return res.json({ ok: true, row: data });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// Delete
+app.delete("/api/admin/scheduled-copy/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ ok: false, message: "Missing id" });
+
+    const { error } = await supabaseAdmin.from("scheduled_copy").delete().eq("id", id);
+    if (error) return res.status(400).json({ ok: false, message: error.message });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
+
+// Copy all rows from quiz -> quiz (with overwrite)
+app.post("/api/admin/scheduled-copy/copy", async (req, res) => {
+  try {
+    const { from_quiz_id, to_quiz_id, overwrite, stat } = req.body || {};
+    const fromId = from_quiz_id ?? null;
+    const toId = to_quiz_id ?? null;
+    const st = Number.isFinite(Number(stat)) ? Number(stat) : 1;
+
+    // 1) fetch source rows
+    let srcQ = supabaseAdmin
+      .from("scheduled_copy")
+      .select("slot, order_index, content, state, stat")
+      .eq("stat", st)
+      .order("slot", { ascending: true })
+      .order("order_index", { ascending: true });
+
+    if (fromId === null) srcQ = srcQ.is("quiz_id", null);
+    else srcQ = srcQ.eq("quiz_id", fromId);
+
+    const { data: srcRows, error: srcErr } = await srcQ;
+    if (srcErr) return res.status(400).json({ ok: false, message: srcErr.message });
+    if (!srcRows || !srcRows.length) return res.status(404).json({ ok: false, message: "لا توجد نصوص في المصدر" });
+
+    // 2) overwrite target rows
+    if (overwrite) {
+      let delQ = supabaseAdmin.from("scheduled_copy").delete().eq("stat", st);
+      if (toId === null) delQ = delQ.is("quiz_id", null);
+      else delQ = delQ.eq("quiz_id", toId);
+
+      const { error: delErr } = await delQ;
+      if (delErr) return res.status(400).json({ ok: false, message: delErr.message });
+    }
+
+    // 3) insert copies
+    const now = new Date().toISOString();
+    const payload = srcRows.map((r) => ({
+      quiz_id: toId,
+      stat: st,
+      state: r.state ?? 1,
+      slot: r.slot,
+      order_index: r.order_index ?? 0,
+      content: r.content,
+      updated_at: now,
+    }));
+
+    const { data: created, error: insErr } = await supabaseAdmin
+      .from("scheduled_copy")
+      .insert(payload)
+      .select("id, quiz_id, stat, state, slot, order_index, content, updated_at");
+
+    if (insErr) return res.status(400).json({ ok: false, message: insErr.message });
+    return res.json({ ok: true, inserted: created?.length || 0 });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: err?.message || "Server error" });
+  }
+});
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
